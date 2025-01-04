@@ -39,7 +39,6 @@ public class SessionRealtime {
     public static void main(String[] args) {
         SessionRealtime au = new SessionRealtime();
         au.start();
-        System.out.println("Fork Test");
     }
 
 }
