@@ -8,10 +8,12 @@ import com.google.protobuf.GeneratedMessage;
 import lombok.extern.slf4j.Slf4j;
 
 import java.io.BufferedReader;
+import java.io.IOException;
 import java.io.InputStreamReader;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.stream.Collectors;
 
@@ -19,132 +21,15 @@ import java.util.stream.Collectors;
 public class SessionCollector extends EndpointCollector {
     private static Map<String, SessionCollectedData> preSessionMap = new ConcurrentHashMap<>();
     private static Map<String, SessionCollectedData> listenMap     = new ConcurrentHashMap<>();
+    // 버퍼 크기를 16KB로 설정
+    private final  int                               bufferSize    = 16 * 1024;
+    private        Set<Integer>                      listenPortSet = new CopyOnWriteArraySet<>();
 
-    public PayloadState.StateBundle collectSession() {
-        long now = System.currentTimeMillis();
+    public List<PayloadState.SessionProcess> convertTcpSession(List<SessionCollectedData> tcpCollectedDataList) {
+        Map<Integer, List<SessionCollectedData>> pidSessionMap = tcpCollectedDataList.stream()
+                                                                                     .collect(Collectors.groupingBy(SessionCollectedData::getPid));
 
-        ProcessBuilder ssTcp = new ProcessBuilder("sh", "-c", "ss -aiOpntH");
-        ProcessBuilder ssUdp = new ProcessBuilder("sh", "-c", "ss -aiOpnuH");
-        ssTcp.redirectErrorStream(true);
-        ssUdp.redirectErrorStream(true);
-        // 버퍼 크기를 16KB로 설정
-        int bufferSize = 16 * 1024;
-        Queue<String> tcpLineQ = new ConcurrentLinkedQueue<>();
-        Queue<String> udpLineQ = new ConcurrentLinkedQueue<>();
-        try {
-            Process ssTcpProc = ssTcp.start();
-            Process ssUdpProc = ssUdp.start();
-
-            BufferedReader reader = new BufferedReader(new InputStreamReader(ssTcpProc.getInputStream()), bufferSize);
-            String line;
-            try {
-                while ((line = reader.readLine()) != null) {
-                    tcpLineQ.add(line);
-                    //                    System.out.println(line);
-                }
-            } catch (Exception e) {
-                e.printStackTrace();
-            }
-
-            BufferedReader udpReader = new BufferedReader(new InputStreamReader(ssUdpProc.getInputStream()), bufferSize);
-            String udpLine;
-            try {
-                while ((udpLine = udpReader.readLine()) != null) {
-                    udpLineQ.add(udpLine);
-                }
-            } catch (Exception e) {
-                e.printStackTrace();
-            }
-            ssUdpProc.waitFor();
-            ssUdpProc.destroy();
-            ssTcpProc.waitFor();
-            ssTcpProc.destroy();
-        } catch (Exception e) {
-            log.error("SS Command Fail : {}", e.getMessage());
-        }
-
-        Set<Integer> listenPortSet = new CopyOnWriteArraySet<>();
-
-        List<SessionCollectedData> tcpCollectedDataList =
-            tcpLineQ.stream()
-                    .parallel()
-                    .map(line -> {
-                        SessionCollectedData sessionCollectedData = new SessionCollectedData(1);
-                        String[] split = line.split("\\s+");
-                        String state = split[0];
-                        PayloadState.SessionState stateEnum = this.fromStateStr(state);
-                        String local = split[3];
-                        String peer = split[4];
-                        Long rxByte = 0L;
-                        Long txByte = 0L;
-                        Long rxPacket = 0L;
-                        Long txPacket = 0L;
-
-                        sessionCollectedData.setLocal(Optional.ofNullable(local)
-                                                              .map(address -> SessionAddress.findMatch(address))
-                                                              .orElse(null));
-                        sessionCollectedData.setPeer(Optional.ofNullable(peer)
-                                                             .map(address -> SessionAddress.findMatch(address))
-                                                             .orElse(null));
-
-                        sessionCollectedData.setState(stateEnum);
-                        sessionCollectedData.setPid(0);
-
-                        sessionCollectedData.setPid(Optional.ofNullable(extractPidWithIndex(line, "pid="))
-                                                            .map(Integer::parseInt)
-                                                            .orElse(0));
-                        txByte   = Optional.ofNullable(extractPidWithIndex(line, "bytes_sent:"))
-                                           .map(Long::parseLong)
-                                           .orElse(0L);
-                        rxByte   = Optional.ofNullable(extractPidWithIndex(line, "bytes_received:"))
-                                           .map(Long::parseLong)
-                                           .orElse(0L);
-                        txPacket = Optional.ofNullable(extractPidWithIndex(line, "segs_out:"))
-                                           .map(Long::parseLong)
-                                           .orElse(0L);
-                        rxPacket = Optional.ofNullable(extractPidWithIndex(line, "segs_in:"))
-                                           .map(Long::parseLong)
-                                           .orElse(0L);
-
-                        SessionCollectedData preSession
-                            = preSessionMap.get(sessionCollectedData.getInterlockId());
-
-                        if (preSession != null) {
-                            long preRxByte = preSession.getRxByte();
-                            long preTxByte = preSession.getTxByte();
-                            long preRxPacket = preSession.getRxPacket();
-                            long preTxPacket = preSession.getTxPacket();
-
-                            rxByte   = rxByte < preRxByte ? rxByte : rxByte - preRxByte;
-                            txByte   = txByte < preTxByte ? txByte : txByte - preTxByte;
-                            rxPacket = rxPacket < preRxPacket ? rxPacket : rxPacket - preRxPacket;
-                            txPacket = txPacket < preTxPacket ? txPacket : txPacket - preTxPacket;
-                        }
-
-                        if (stateEnum == PayloadState.SessionState.LISTEN) {
-                            Optional.ofNullable(sessionCollectedData.getLocal())
-                                    .map(SessionAddress::getPort)
-                                    .ifPresent(listenPortSet::add);
-                        } else {
-                            sessionCollectedData.setRxByte(rxByte);
-                            sessionCollectedData.setTxByte(txByte);
-                            sessionCollectedData.setRxPacket(rxPacket);
-                            sessionCollectedData.setTxPacket(txPacket);
-                        }
-
-                        return sessionCollectedData;
-                    })
-                    .collect(Collectors.toList());
-
-        Map<Integer, List<SessionCollectedData>> pidSessionMap =
-            tcpCollectedDataList.stream()
-                                .collect(Collectors.groupingBy(SessionCollectedData::getPid));
-
-
-        /* Convert Protobuf */
-
-        PayloadState.StateBundle.Builder sessionBundleBuilder = PayloadState.StateBundle.newBuilder();
-        sessionBundleBuilder.setCollectTime(now);
+        List<PayloadState.SessionProcess> sessionProcessList = new CopyOnWriteArrayList<>();
 
         pidSessionMap.entrySet()
                      .forEach(entry -> {
@@ -255,10 +140,11 @@ public class SessionCollector extends EndpointCollector {
                              });
                          }
 
-                         sessionBundleBuilder.addData(Any.pack(pidSessionBuilder.build()));
+                         sessionProcessList.add(pidSessionBuilder.build());
                      });
         preSessionMap.clear();
         listenMap.clear();
+
         tcpCollectedDataList.parallelStream()
                             .forEach(session -> {
                                 if (session.getState() == PayloadState.SessionState.LISTEN) {
@@ -267,6 +153,148 @@ public class SessionCollector extends EndpointCollector {
                                     preSessionMap.put(session.getInterlockId(), session);
                                 }
                             });
+        return sessionProcessList;
+    }
+
+    public List<SessionCollectedData> tcpSessionParsing(Queue<String> tcpLineQ) {
+        List<SessionCollectedData> tcpCollectedDataList = tcpLineQ.stream()
+                                                                  .parallel()
+                                                                  .map(line -> {
+                                                                      SessionCollectedData sessionCollectedData = new SessionCollectedData(1);
+                                                                      String[] split = line.split("\\s+");
+                                                                      String state = split[0];
+                                                                      PayloadState.SessionState stateEnum = this.fromStateStr(state);
+                                                                      String local = split[3];
+                                                                      String peer = split[4];
+                                                                      Long rxByte = 0L;
+                                                                      Long txByte = 0L;
+                                                                      Long rxPacket = 0L;
+                                                                      Long txPacket = 0L;
+
+                                                                      sessionCollectedData.setLocal(Optional.ofNullable(local)
+                                                                                                            .map(address -> SessionAddress.findMatch(address))
+                                                                                                            .orElse(null));
+                                                                      sessionCollectedData.setPeer(Optional.ofNullable(peer)
+                                                                                                           .map(address -> SessionAddress.findMatch(address))
+                                                                                                           .orElse(null));
+
+                                                                      sessionCollectedData.setState(stateEnum);
+                                                                      sessionCollectedData.setPid(0);
+
+                                                                      sessionCollectedData.setPid(Optional.ofNullable(extractPidWithIndex(line, "pid="))
+                                                                                                          .map(Integer::parseInt)
+                                                                                                          .orElse(0));
+                                                                      txByte   = Optional.ofNullable(extractPidWithIndex(line, "bytes_sent:"))
+                                                                                         .map(Long::parseLong)
+                                                                                         .orElse(0L);
+                                                                      rxByte   = Optional.ofNullable(extractPidWithIndex(line, "bytes_received:"))
+                                                                                         .map(Long::parseLong)
+                                                                                         .orElse(0L);
+                                                                      txPacket = Optional.ofNullable(extractPidWithIndex(line, "segs_out:"))
+                                                                                         .map(Long::parseLong)
+                                                                                         .orElse(0L);
+                                                                      rxPacket = Optional.ofNullable(extractPidWithIndex(line, "segs_in:"))
+                                                                                         .map(Long::parseLong)
+                                                                                         .orElse(0L);
+
+                                                                      SessionCollectedData
+                                                                          preSession
+                                                                          = preSessionMap.get(sessionCollectedData.getInterlockId());
+
+                                                                      if (preSession != null) {
+                                                                          long preRxByte = preSession.getRxByte();
+                                                                          long preTxByte = preSession.getTxByte();
+                                                                          long preRxPacket = preSession.getRxPacket();
+                                                                          long preTxPacket = preSession.getTxPacket();
+
+                                                                          rxByte   = rxByte < preRxByte ? rxByte : rxByte - preRxByte;
+                                                                          txByte   = txByte < preTxByte ? txByte : txByte - preTxByte;
+                                                                          rxPacket = rxPacket < preRxPacket ? rxPacket : rxPacket - preRxPacket;
+                                                                          txPacket = txPacket < preTxPacket ? txPacket : txPacket - preTxPacket;
+                                                                      }
+
+                                                                      if (stateEnum == PayloadState.SessionState.LISTEN) {
+                                                                          Optional.ofNullable(sessionCollectedData.getLocal())
+                                                                                  .map(SessionAddress::getPort)
+                                                                                  .ifPresent(listenPortSet::add);
+                                                                      } else {
+                                                                          sessionCollectedData.setRxByte(rxByte);
+                                                                          sessionCollectedData.setTxByte(txByte);
+                                                                          sessionCollectedData.setRxPacket(rxPacket);
+                                                                          sessionCollectedData.setTxPacket(txPacket);
+                                                                      }
+
+                                                                      return sessionCollectedData;
+                                                                  })
+                                                                  .collect(Collectors.toList());
+        return tcpCollectedDataList;
+    }
+
+    public void convertUdpSession(List<SessionCollectedData> sessionCollectedDataList) {
+        try {
+            long now = System.currentTimeMillis();
+            ProcessBuilder ssUdp = new ProcessBuilder("sh", "-c", "ss -aiOpnuH");
+            ssUdp.redirectErrorStream(true);
+            Queue<String> udpLineQ = new ConcurrentLinkedQueue<>();
+
+            String udpLine;
+            Process ssUdpProc = ssUdp.start();
+            BufferedReader udpReader = new BufferedReader(new InputStreamReader(ssUdpProc.getInputStream()), bufferSize);
+
+            try {
+                while ((udpLine = udpReader.readLine()) != null) {
+                    udpLineQ.add(udpLine);
+                }
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+
+            ssUdpProc.waitFor();
+            ssUdpProc.destroy();
+        } catch (InterruptedException e) {
+            throw new RuntimeException(e);
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public Queue<String> tcpSessionCommand() {
+        ProcessBuilder ssTcp = new ProcessBuilder("sh", "-c", "ss -aiOpntH");
+        ssTcp.redirectErrorStream(true);
+        Queue<String> tcpLineQ = new ConcurrentLinkedQueue<>();
+        try {
+            Process ssTcpProc = ssTcp.start();
+
+            BufferedReader reader = new BufferedReader(new InputStreamReader(ssTcpProc.getInputStream()), bufferSize);
+            String line;
+            try {
+                while ((line = reader.readLine()) != null) {
+                    tcpLineQ.add(line);
+                    //                    System.out.println(line);
+                }
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+            ssTcpProc.waitFor();
+            ssTcpProc.destroy();
+        } catch (Exception e) {
+            log.error("SS Command Fail : {}", e.getMessage());
+        }
+        return tcpLineQ;
+    }
+
+    public PayloadState.StateBundle collectSession() {
+        long now = System.currentTimeMillis();
+        PayloadState.StateBundle.Builder sessionBundleBuilder = PayloadState.StateBundle.newBuilder();
+        sessionBundleBuilder.setCollectTime(now);
+
+        Queue<String> tcpSessionCommandResult = this.tcpSessionCommand();
+        List<SessionCollectedData> tcpSessionCollectedData = this.tcpSessionParsing(tcpSessionCommandResult);
+        List<PayloadState.SessionProcess> tcpSessionList = this.convertTcpSession(tcpSessionCollectedData);
+
+        sessionBundleBuilder.addAllData(tcpSessionList.stream()
+                                                      .map(Any::pack)
+                                                      .collect(Collectors.toList()));
 
         log.debug("session count : {}, listen count : {}", preSessionMap.size(), listenMap.size());
 
