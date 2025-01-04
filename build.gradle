@@ -1,0 +1,109 @@
+plugins {
+    id 'java'
+    id 'maven-publish'
+}
+
+group = 'com.elixcore.collector'
+version = '1.0-SNAPSHOT'
+
+def nexusUrl = 'http://elixcore.iptime.org:18081/repository/pivot/'
+
+repositories {
+    mavenCentral()
+    maven {
+        url = nexusUrl
+        allowInsecureProtocol = true
+        credentials {
+            username = "admin"
+            password = "elixcore123!@#"
+        }
+    }
+}
+
+def customOutputDir = "/res_dev/pivot_git/endpoint/src/main/resources/bin/collector"
+
+// JAR 파일을 복사하는 새로운 태스크 정의
+task copyJarToCustomDir(type: Copy) {
+    from jar  // jar 태스크의 출력을 소스로 사용
+    into customOutputDir  // 사용자 정의 출력 디렉토리로 복사
+
+    doLast {
+        println "JAR 파일이 다음 위치로 복사되었습니다: $customOutputDir"
+        file(customOutputDir).eachFile { file ->
+            println " - ${file.name}"
+        }
+    }
+}
+
+// build 태스크 완료 후 copyJarToCustomDir 태스크가 실행되도록 설정
+build.finalizedBy(copyJarToCustomDir)
+
+// (선택사항) 기존 JAR 태스크에 로깅 추가
+
+ext {
+    applicationName = 'collector_session'
+    applicationVersion = '0.1'
+//    applicationVender = 'elixcore'
+}
+
+jar {
+    archiveBaseName.set("${applicationName}")
+    archiveVersion.set("${applicationVersion}")
+//    archiveClassifier.set("${applicationVender}")
+    doLast {
+        println "기본 JAR 파일이 생성되었습니다: ${archiveFile.get()}"
+    }
+}
+
+dependencies {
+    implementation platform('io.projectreactor:reactor-bom:2022.0.20')
+
+    implementation 'io.projectreactor.netty:reactor-netty-core'
+
+    testImplementation platform('org.junit:junit-bom:5.10.0')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+
+    compileOnly 'org.projectlombok:lombok:1.18.34'
+    annotationProcessor('org.projectlombok:lombok:1.18.34')
+
+    compileOnly 'org.projectlombok:lombok:1.18.32'
+
+    implementation 'org.slf4j:slf4j-api:2.0.16'
+    implementation 'org.apache.logging.log4j:log4j-api:2.23.1'
+    implementation 'org.apache.logging.log4j:log4j-core:2.23.1'
+    implementation 'org.apache.logging.log4j:log4j-slf4j2-impl:2.23.1'
+    implementation 'org.apache.commons:commons-text:1.12.0'
+
+    implementation 'org.slf4j:log4j-over-slf4j:2.0.16'
+
+//    implementation 'net.contentobjects.jnotify:jnotify:0.94'
+    // pivot lib
+    implementation 'com.pivot.lib:collector:0.1'
+//    implementation 'net.java.dev.jna:jna:5.8.0'
+//    implementation 'com.github.jnr:jnr-ffi:2.2.12'
+    implementation 'org.quartz-scheduler:quartz:2.3.2'
+}
+
+tasks.test {
+    useJUnitPlatform()
+}
+publishing {
+    publications {
+        maven(MavenPublication) {
+            from components.java
+            groupId = 'collector'
+            artifactId = 'session'
+            version = '0.1'
+        }
+    }
+    repositories {
+        maven {
+            url = 'http://elixcore.iptime.org:18081/repository/elixcore/'
+            allowInsecureProtocol = true
+            credentials {
+                username = "admin"
+                password = "elixcore123!@#"
+            }
+        }
+    }
+}
